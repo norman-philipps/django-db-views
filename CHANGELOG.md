@@ -5,6 +5,9 @@ Changelogs starts from version 0.1.3
 
 ## Released
 
+### [0.1.13]
+- register comments on fields in DBView models
+
 ### [0.1.12]
 - quote view names at migrations as django does with table names.
 
