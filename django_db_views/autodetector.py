@@ -5,37 +5,39 @@ import six
 import sqlparse
 from django.apps import apps
 from django.conf import settings
-from django.db import connection, ProgrammingError
+from django.db import connection, models, ProgrammingError
 from django.db.migrations import SeparateDatabaseAndState
 from django.db.migrations.autodetector import MigrationAutodetector
 from django.db.migrations.graph import MigrationGraph
 
-from django_db_views.db_view import DBView, DBMaterializedView, DBViewsRegistry
+from django_db_views.db_view import DBMaterializedView, DBView, DBViewsRegistry
 from django_db_views.operations import (
-    ViewRunPython,
+    AddFieldComment,
+    AlterFieldComment,
     DBViewModelState,
     ViewDropRunPython,
+    ViewRunPython, RemoveFieldComment,
 )
 from django_db_views.migration_functions import (
-    ForwardViewMigration,
-    BackwardViewMigration,
-    ForwardMaterializedViewMigration,
     BackwardMaterializedViewMigration,
-    ForwardViewMigrationBase,
+    BackwardViewMigration,
     BackwardViewMigrationBase,
-    DropView,
     DropMaterializedView,
+    DropView,
     DropViewMigration,
+    ForwardMaterializedViewMigration,
+    ForwardViewMigration,
+    ForwardViewMigrationBase,
 )
 
 
 class ViewMigrationAutoDetector(MigrationAutodetector):
     """
-    We overwritten only _detect_changes function.
-    It's almost same code as in regular function,
-    we just removed generating other operations, and instead of them added our detection.
-    rest methods are fully our code which we use for detection.
-    It's detect only view model changes.
+    We have overwritten only the `_detect_changes` function.
+    It's almost the same code as in the regular function.
+    We just removed generating other operations, and instead of them added our detection.
+    Other methods are our code that we use for detection.
+    It's detecting only view model changes and comment changes.
     """
 
     def _detect_changes(self, convert_apps=None, graph=None) -> dict:
@@ -43,21 +45,41 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
         if django.VERSION >= (4,):
             self._detect_changes_preparation_django_version_4_and_above(convert_apps)
         else:
-            self._detect_changes_preparation_django_below_version_4(convert_apps)
+            raise Exception("Django version must be >= 4")
+
+        # Renames have to come first
+        self.generate_renamed_models()
+
+        # Prepare lists of fields and generate through model map
+        self._prepare_field_lists()
+        self._generate_through_model_map()
+
+        # Create the renamed fields and store them in self.renamed_fields.
+        # They are used by create_altered_indexes(), generate_altered_fields(),
+        # generate_removed_altered_index/unique_together(), and
+        # generate_altered_index/unique_together().
+        self.create_renamed_fields()
+
+        # Generate field operations.
+        self.generate_removed_fields()
         # <END of copy paste from MigrationAutodetector>
 
+        # Generate view operations.
         self.generate_views_operations(graph)
         self.delete_old_views()
 
-        if django.VERSION >= (3, 2):
-            # we write custom detect cus views indexes are much more simpler.
-            self.old_indexes = set()
-            self.new_indexes = set()
-            self.detect_index_changes()
-            self.drop_indexes()
-            self.generate_indexes()
-
         # <START copy paste from MigrationAutodetector>
+        # Generate field operations.
+        self.generate_added_fields()
+        self.generate_altered_fields()
+
+        # Use indices because they are much simpler.
+        self.old_indexes = set()
+        self.new_indexes = set()
+        self.detect_index_changes()
+        self.drop_indexes()
+        self.generate_indexes()
+
         self._sort_migrations()
         self._build_migration_list(graph)
         self._optimize_migrations()
@@ -65,47 +87,11 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
         return self.migrations
         # <END end of copy paste from MigrationAutodetector>
 
-    def _detect_changes_preparation_django_below_version_4(self, convert_apps):
-        self.generated_operations = {}
-        self.altered_indexes = {}
-
-        # Prepare some old/new state and model lists, separating
-        # proxy models and ignoring unmigrated apps.
-        self.old_apps = self.from_state.concrete_apps
-        self.new_apps = self.to_state.apps
-        self.old_model_keys = []
-        self.old_proxy_keys = []
-        self.old_unmanaged_keys = []
-        self.new_model_keys = []
-        self.new_proxy_keys = []
-        self.new_unmanaged_keys = []
-
-        for al, mn in sorted(self.from_state.models.keys()):
-            model = self.old_apps.get_model(al, mn)
-            if not model._meta.managed:
-                self.old_unmanaged_keys.append((al, mn))
-            elif al not in self.from_state.real_apps:
-                if model._meta.proxy:
-                    self.old_proxy_keys.append((al, mn))
-                else:
-                    self.old_model_keys.append((al, mn))
-
-        for al, mn in sorted(self.to_state.models.keys()):
-            model = self.new_apps.get_model(al, mn)
-            if not model._meta.managed:
-                self.new_unmanaged_keys.append((al, mn))
-            elif al not in self.from_state.real_apps or (
-                convert_apps and al in convert_apps
-            ):
-                if model._meta.proxy:
-                    self.new_proxy_keys.append((al, mn))
-                else:
-                    self.new_model_keys.append((al, mn))
-
     def _detect_changes_preparation_django_version_4_and_above(self, convert_apps):
         self.generated_operations = {}
         self.altered_indexes = {}
         self.altered_constraints = {}
+        self.renamed_fields = {}
 
         # Prepare some old/new state and model lists, separating
         # proxy models and ignoring unmigrated apps.
@@ -118,31 +104,51 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
         for (app_label, model_name), model_state in self.from_state.models.items():
             if not model_state.options.get("managed", True):
                 self.old_unmanaged_keys.add((app_label, model_name))
-            elif app_label not in self.from_state.real_apps:
-                if model_state.options.get("proxy"):
-                    self.old_proxy_keys.add((app_label, model_name))
-                else:
-                    self.old_model_keys.add((app_label, model_name))
+            # elif app_label not in self.from_state.real_apps:
+            #     if model_state.options.get("proxy"):
+            #         self.old_proxy_keys.add((app_label, model_name))
+            #     else:
+            #         self.old_model_keys.add((app_label, model_name))
 
         for (app_label, model_name), model_state in self.to_state.models.items():
             if not model_state.options.get("managed", True):
                 self.new_unmanaged_keys.add((app_label, model_name))
-            elif app_label not in self.from_state.real_apps or (
-                convert_apps and app_label in convert_apps
-            ):
-                if model_state.options.get("proxy"):
-                    self.new_proxy_keys.add((app_label, model_name))
-                else:
-                    self.new_model_keys.add((app_label, model_name))
+            # elif app_label not in self.from_state.real_apps or (
+            #     convert_apps and app_label in convert_apps
+            # ):
+            #     if model_state.options.get("proxy"):
+            #         self.new_proxy_keys.add((app_label, model_name))
+            #     else:
+            #         self.new_model_keys.add((app_label, model_name))
 
         self.from_state.resolve_fields_and_relations()
         self.to_state.resolve_fields_and_relations()
 
+    def _prepare_field_lists(self):
+        """
+        Prepare field lists and a list of the fields that used through models
+        in the old state so dependencies can be made from the through model
+        deletion to the field that uses it.
+        """
+        self.kept_model_keys = self.old_model_keys & self.new_model_keys
+        self.kept_proxy_keys = self.old_proxy_keys & self.new_proxy_keys
+        self.kept_unmanaged_keys = self.old_unmanaged_keys & self.new_unmanaged_keys
+        self.through_users = {}
+        self.old_field_keys = {
+            (app_label, model_name, field_name)
+            for app_label, model_name in self.kept_unmanaged_keys
+            for field_name in self.from_state.models[
+                app_label, self.renamed_models.get((app_label, model_name), model_name),
+            ].fields
+        }
+        self.new_field_keys = {
+            (app_label, model_name, field_name)
+            for app_label, model_name in self.kept_unmanaged_keys
+            for field_name in self.to_state.models[app_label, model_name].fields
+        }
+
     def delete_old_views(self):
-        for (
-            app_label,
-            table_name,
-        ), model_state in self.get_previous_view_models_state().items():
+        for (app_label, table_name), model_state in self.get_previous_view_models_state().items():
             if model_state.table_name not in DBViewsRegistry:
                 self.add_operation(
                     app_label,
@@ -162,6 +168,14 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
     def get_previous_view_models_state(self) -> dict:
         view_models = {}
         for (app_label, table_name), model_state in self.from_state.models.items():
+            if isinstance(model_state, DBViewModelState):
+                key = (app_label, table_name)
+                view_models[key] = model_state
+        return view_models
+
+    def get_current_view_models_state(self) -> dict:
+        view_models = {}
+        for (app_label, table_name), model_state in self.to_state.models.items():
             if isinstance(model_state, DBViewModelState):
                 key = (app_label, table_name)
                 view_models[key] = model_state
@@ -274,7 +288,7 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
         return view_definitions
 
     def get_previous_view_definition_state(
-        self, graph: MigrationGraph, app_label: str, for_table_name: str, engine: str
+        self, graph: MigrationGraph, app_label: str, for_table_name: str, engine: str,
     ) -> str:
         nodes = graph.leaf_nodes(app_label)
         last_node = nodes[0] if nodes else None
@@ -303,7 +317,8 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
                         if view_operations:
                             assert (
                                 len(view_operations) <= 1
-                            ), "SeparateDatabaseAndState can't contain more than one ViewRunPython operation"
+                            ), ("SeparateDatabaseAndState can't contain more than one "
+                                "ViewRunPython operation")
                             view_operation = view_operations[0]
                             (
                                 table_name,
@@ -355,6 +370,134 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
                 current_view_definition = ""
             finally:
                 return current_view_definition
+
+    def _generate_added_field(self, app_label, model_name, field_name):
+        # <START copy paste from MigrationAutodetector>
+        field = self.to_state.models[app_label, model_name].get_field(field_name)
+        # Adding a field always depends at least on its removal.
+        dependencies = [(app_label, model_name, field_name, False)]
+        # Fields that are foreignkeys/m2ms depend on stuff.
+        if field.remote_field and field.remote_field.model:
+            dependencies.extend(
+                self._get_dependencies_for_foreign_key(
+                    app_label,
+                    model_name,
+                    field,
+                    self.to_state,
+                )
+            )
+        # <END of copy paste from MigrationAutodetector>
+
+        self.add_operation(
+            app_label,
+            AddFieldComment(
+                model_name=model_name,
+                name=field_name,
+                field=field,
+            ),
+            dependencies=dependencies,
+        )
+
+    def _generate_removed_field(self, app_label, model_name, field_name):
+
+        if django.VERSION >= (5, 1):
+            from django.db.migrations.autodetector import OperationDependency
+            dependencies = [
+                OperationDependency(
+                    app_label,
+                    model_name,
+                    field_name,
+                    OperationDependency.Type.REMOVE_ORDER_WRT,
+                ),
+                OperationDependency(
+                    app_label,
+                    model_name,
+                    field_name,
+                    OperationDependency.Type.ALTER_FOO_TOGETHER,
+                ),
+            ]
+        else:
+            dependencies = [
+                (app_label, model_name, field_name, "order_wrt_unset"),
+                (app_label, model_name, field_name, "foo_together_change"),
+            ]
+
+        self.add_operation(
+            app_label,
+            RemoveFieldComment(
+                model_name=model_name,
+                name=field_name,
+            ),
+            # We might need to depend on the removal of an
+            # order_with_respect_to or index/unique_together operation;
+            # this is safely ignored if there isn't one
+
+            dependencies=dependencies,
+        )
+
+    def generate_altered_fields(self):
+        """
+        Make AlterField operations, or possibly RemovedField/AddField if alter
+        isn't possible.
+        """
+        for app_label, model_name, field_name in sorted(
+            self.old_field_keys & self.new_field_keys
+        ):
+            # Did the field change?
+            old_model_name = self.renamed_models.get(
+                (app_label, model_name), model_name
+            )
+            old_field_name = self.renamed_fields.get(
+                (app_label, model_name, field_name), field_name
+            )
+            old_field = self.from_state.models[app_label, old_model_name].get_field(
+                old_field_name
+            )
+            new_field = self.to_state.models[app_label, model_name].get_field(
+                field_name
+            )
+            dependencies = []
+            old_field_dec = self.deep_deconstruct(old_field)
+            new_field_dec = self.deep_deconstruct(new_field)
+            # If the field was confirmed to be renamed it means that only
+            # db_column was allowed to change which generate_renamed_fields()
+            # already accounts for by adding an AlterField operation.
+            if old_field_dec != new_field_dec and old_field_name == field_name:
+                both_m2m = old_field.many_to_many and new_field.many_to_many
+                neither_m2m = not old_field.many_to_many and not new_field.many_to_many
+                if both_m2m or neither_m2m:
+                    # Either both fields are m2m or neither is
+                    preserve_default = True
+                    if (
+                        old_field.null
+                        and not new_field.null
+                        and not new_field.has_default()
+                        and new_field.db_default is models.NOT_PROVIDED
+                        and not new_field.many_to_many
+                    ):
+                        field = new_field.clone()
+                        new_default = self.questioner.ask_not_null_alteration(
+                            field_name, model_name
+                        )
+                        if new_default is not models.NOT_PROVIDED:
+                            field.default = new_default
+                            preserve_default = False
+                    else:
+                        field = new_field
+                    self.add_operation(
+                        app_label,
+                        AlterFieldComment(
+                            model_name=model_name,
+                            name=field_name,
+                            field=field,
+                            preserve_default=preserve_default,
+                        ),
+                        dependencies=dependencies,
+                    )
+                else:
+                    # We cannot alter between m2m and concrete fields
+                    self._generate_removed_field(app_label, model_name, field_name)
+                    self._generate_added_field(app_label, model_name, field_name)
 
     def detect_index_changes(self):
         pass
