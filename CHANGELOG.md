@@ -5,6 +5,9 @@ Changelogs starts from version 0.1.3
 
 ## Released
 
+### [0.1.14]
+- fixed removing field comments in views
+
 ### [0.1.13]
 - register comments on fields in DBView models
 

@@ -5,27 +5,29 @@ import six
 import sqlparse
 from django.apps import apps
 from django.conf import settings
-from django.db import connection, ProgrammingError, models
+from django.db import connection, models, ProgrammingError
 from django.db.migrations import SeparateDatabaseAndState
 from django.db.migrations.autodetector import MigrationAutodetector
 from django.db.migrations.graph import MigrationGraph
 
-from django_db_views.db_view import DBView, DBMaterializedView, DBViewsRegistry
+from django_db_views.db_view import DBMaterializedView, DBView, DBViewsRegistry
 from django_db_views.operations import (
-    ViewRunPython,
+    AddFieldComment,
+    AlterFieldComment,
     DBViewModelState,
-    ViewDropRunPython, AddFieldComment, AlterFieldComment,
+    ViewDropRunPython,
+    ViewRunPython, RemoveFieldComment,
 )
 from django_db_views.migration_functions import (
-    ForwardViewMigration,
-    BackwardViewMigration,
-    ForwardMaterializedViewMigration,
     BackwardMaterializedViewMigration,
-    ForwardViewMigrationBase,
+    BackwardViewMigration,
     BackwardViewMigrationBase,
-    DropView,
     DropMaterializedView,
+    DropView,
     DropViewMigration,
+    ForwardMaterializedViewMigration,
+    ForwardViewMigration,
+    ForwardViewMigrationBase,
 )
 
 
@@ -102,26 +104,25 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
         for (app_label, model_name), model_state in self.from_state.models.items():
             if not model_state.options.get("managed", True):
                 self.old_unmanaged_keys.add((app_label, model_name))
-            elif app_label not in self.from_state.real_apps:
-                if model_state.options.get("proxy"):
-                    self.old_proxy_keys.add((app_label, model_name))
-                else:
-                    self.old_model_keys.add((app_label, model_name))
+            # elif app_label not in self.from_state.real_apps:
+            #     if model_state.options.get("proxy"):
+            #         self.old_proxy_keys.add((app_label, model_name))
+            #     else:
+            #         self.old_model_keys.add((app_label, model_name))
 
         for (app_label, model_name), model_state in self.to_state.models.items():
             if not model_state.options.get("managed", True):
                 self.new_unmanaged_keys.add((app_label, model_name))
-            elif app_label not in self.from_state.real_apps or (
-                convert_apps and app_label in convert_apps
-            ):
-                if model_state.options.get("proxy"):
-                    self.new_proxy_keys.add((app_label, model_name))
-                else:
-                    self.new_model_keys.add((app_label, model_name))
+            # elif app_label not in self.from_state.real_apps or (
+            #     convert_apps and app_label in convert_apps
+            # ):
+            #     if model_state.options.get("proxy"):
+            #         self.new_proxy_keys.add((app_label, model_name))
+            #     else:
+            #         self.new_model_keys.add((app_label, model_name))
 
         self.from_state.resolve_fields_and_relations()
         self.to_state.resolve_fields_and_relations()
-
 
     def _prepare_field_lists(self):
         """
@@ -135,22 +136,19 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
         self.through_users = {}
         self.old_field_keys = {
             (app_label, model_name, field_name)
-            for app_label, model_name in self.kept_model_keys | self.kept_unmanaged_keys
+            for app_label, model_name in self.kept_unmanaged_keys
             for field_name in self.from_state.models[
-                app_label, self.renamed_models.get((app_label, model_name), model_name)
+                app_label, self.renamed_models.get((app_label, model_name), model_name),
             ].fields
         }
         self.new_field_keys = {
             (app_label, model_name, field_name)
-            for app_label, model_name in self.kept_model_keys | self.kept_unmanaged_keys
+            for app_label, model_name in self.kept_unmanaged_keys
             for field_name in self.to_state.models[app_label, model_name].fields
         }
 
     def delete_old_views(self):
-        for (
-            app_label,
-            table_name,
-        ), model_state in self.get_previous_view_models_state().items():
+        for (app_label, table_name), model_state in self.get_previous_view_models_state().items():
             if model_state.table_name not in DBViewsRegistry:
                 self.add_operation(
                     app_label,
@@ -170,6 +168,14 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
     def get_previous_view_models_state(self) -> dict:
         view_models = {}
         for (app_label, table_name), model_state in self.from_state.models.items():
+            if isinstance(model_state, DBViewModelState):
+                key = (app_label, table_name)
+                view_models[key] = model_state
+        return view_models
+
+    def get_current_view_models_state(self) -> dict:
+        view_models = {}
+        for (app_label, table_name), model_state in self.to_state.models.items():
             if isinstance(model_state, DBViewModelState):
                 key = (app_label, table_name)
                 view_models[key] = model_state
@@ -282,7 +288,7 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
         return view_definitions
 
     def get_previous_view_definition_state(
-        self, graph: MigrationGraph, app_label: str, for_table_name: str, engine: str
+        self, graph: MigrationGraph, app_label: str, for_table_name: str, engine: str,
     ) -> str:
         nodes = graph.leaf_nodes(app_label)
         last_node = nodes[0] if nodes else None
@@ -311,7 +317,8 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
                         if view_operations:
                             assert (
                                 len(view_operations) <= 1
-                            ), "SeparateDatabaseAndState can't contain more than one ViewRunPython operation"
+                            ), ("SeparateDatabaseAndState can't contain more than one "
+                                "ViewRunPython operation")
                             view_operation = view_operations[0]
                             (
                                 table_name,
@@ -391,6 +398,43 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
             dependencies=dependencies,
         )
 
+    def _generate_removed_field(self, app_label, model_name, field_name):
+
+        if django.VERSION >= (5, 1):
+            from django.db.migrations.autodetector import OperationDependency
+            dependencies = [
+                OperationDependency(
+                    app_label,
+                    model_name,
+                    field_name,
+                    OperationDependency.Type.REMOVE_ORDER_WRT,
+                ),
+                OperationDependency(
+                    app_label,
+                    model_name,
+                    field_name,
+                    OperationDependency.Type.ALTER_FOO_TOGETHER,
+                ),
+            ]
+        else:
+            dependencies = [
+                (app_label, model_name, field_name, "order_wrt_unset"),
+                (app_label, model_name, field_name, "foo_together_change"),
+            ]
+
+        self.add_operation(
+            app_label,
+            RemoveFieldComment(
+                model_name=model_name,
+                name=field_name,
+            ),
+            # We might need to depend on the removal of an
+            # order_with_respect_to or index/unique_together operation;
+            # this is safely ignored if there isn't one
+
+            dependencies=dependencies,
+        )
+
     def generate_altered_fields(self):
         """
         Make AlterField operations, or possibly RemovedField/AddField if alter
@@ -454,7 +498,6 @@ class ViewMigrationAutoDetector(MigrationAutodetector):
                     # We cannot alter between m2m and concrete fields
                     self._generate_removed_field(app_label, model_name, field_name)
                     self._generate_added_field(app_label, model_name, field_name)
-
 
     def detect_index_changes(self):
         pass
